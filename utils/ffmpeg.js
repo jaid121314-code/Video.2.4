@@ -64,15 +64,21 @@ function runFfmpeg(args, description = "ffmpeg", { onProgress } = {}) {
 
     proc.on("error", (err) => reject(new Error(`FFmpeg spawn failed: ${err.message}`)));
 
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       // Release listeners so the process object can be GC'd promptly.
       proc.stderr.removeAllListeners();
       if (code === 0) return resolve({ stderr: tail });
+      // A process killed by the OOM killer (Railway/Linux) reports code=null
+      // with signal='SIGKILL' — NOT exit code 137. The old check only ever
+      // looked at `code`, so real OOM kills were misreported as generic
+      // "failed (code null)" errors and never got the OOM backoff/retry.
       const oom =
-        code === 137 || /Cannot allocate memory|Out of memory|ENOMEM/i.test(tail);
-      const err = new Error(
-        `${description} ${oom ? "OOM-killed" : `failed (code ${code})`} — mem=${logger.mem()}MB\n${tail.slice(-800)}`,
-      );
+        code === 137 ||
+        signal === "SIGKILL" ||
+        signal === "SIGABRT" ||
+        /Cannot allocate memory|Out of memory|ENOMEM/i.test(tail);
+      const codeLabel = signal ? `killed by ${signal}${oom ? " — likely OOM" : ""}` : `failed (code ${code})`;
+      const err = new Error(`${description} ${codeLabel} — mem=${logger.mem()}MB\n${tail.slice(-800)}`);
       err.oom = oom;
       reject(err);
     });
