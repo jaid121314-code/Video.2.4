@@ -1,9 +1,35 @@
 "use strict";
 
+const fs = require("fs");
 const multer = require("multer");
 const path = require("path");
 const config = require("../config");
-const { randomId } = require("../utils/files");
+const { randomId, safeName } = require("../utils/files");
+
+/**
+ * Resolve the project/panel ids a panel-upload request is for.
+ *
+ * IMPORTANT: this is called from multer's destination() callback, which
+ * fires once per incoming file *as multer streams the multipart body*.
+ * express never parses multipart bodies itself, so req.body is only ever
+ * populated by multer's own field parser as it goes — meaning any text
+ * fields the client appended to the FormData *before* the file fields
+ * (project_id/panel_id in this app) are already on req.body by the time
+ * the image/audio file arrives, even though the request as a whole hasn't
+ * finished parsing yet. Query params (if the client used them) are used
+ * first since those are known immediately, before parsing even starts.
+ */
+function resolvePanelIds(req) {
+  const projectId = safeName(
+    req.query.project_id || req.query.projectId || req.body?.project_id || req.body?.projectId,
+    null,
+  );
+  const panelId = safeName(
+    req.query.panel_id || req.query.panelId || req.body?.panel_id || req.body?.panelId,
+    null,
+  );
+  return { projectId, panelId };
+}
 
 function diskStorage(destination, prefix) {
   return multer.diskStorage({
@@ -22,9 +48,30 @@ function diskStorage(destination, prefix) {
  */
 const panelUpload = multer({
   storage: multer.diskStorage({
+    // Resolve the *real* project/panel dir directly, per-file, instead of
+    // writing into a temp dir and renaming it after the fact. This is what
+    // removes the ENOENT-on-rename race: the file is written straight into
+    // its final home the first time, so there is no second folder for a
+    // concurrent request to have already moved out from under us.
     destination: (req, file, cb) => {
-      const dir = req._panelDir;
-      if (!dir) return cb(new Error("panel directory not prepared"));
+      if (req._panelDir) return cb(null, req._panelDir); // already resolved for this request (2nd file field)
+      const { projectId, panelId } = resolvePanelIds(req);
+      if (!projectId || !panelId) {
+        return cb(
+          new Error(
+            "project_id and panel_id must be included as form fields (or query params) BEFORE the image/audio fields in the upload request",
+          ),
+        );
+      }
+      const dir = path.join(config.dirs.uploads, projectId, panelId);
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+      } catch (err) {
+        return cb(err);
+      }
+      req._panelDir = dir;
+      req._projectId = projectId;
+      req._panelId = panelId;
       cb(null, dir);
     },
     filename: (_req, file, cb) => {
