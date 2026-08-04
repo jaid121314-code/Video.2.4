@@ -35,20 +35,37 @@ function diskStorage(destination, prefix) {
 }
 
 /**
- * Panel upload buffers image/audio in memory instead of streaming to a
- * per-file destination. This is deliberate: multer parses a multipart
- * request's parts strictly in the order the browser appended them, and
- * different frontends append the id fields and the file fields in
- * different orders — some send ids first, some send the image first. A
- * destination() callback can only see whatever has already been parsed at
- * that instant, so it can never be reliably correct for both orderings.
- * Buffering the (small, single-image/audio) files in RAM and writing them
- * out ourselves once the whole request is fully parsed sidesteps that
- * entirely — by the time our route handler runs, req.body always has
- * every field, no matter what order the client sent them in.
+ * Panel upload streams straight to a per-request temp folder on disk — NOT
+ * RAM. (An earlier version of this fix used multer's memoryStorage to
+ * sidestep field-order issues, but that meant every image+audio buffer sat
+ * in RAM for the life of the request. Fine for a handful of uploads; with
+ * hundreds of concurrent panel uploads it's exactly the kind of memory
+ * pressure that OOM-crashes the whole process, not just one FFmpeg clip —
+ * which looks like the server randomly restarting mid-batch.)
+ *
+ * The temp dir name is a random per-request id, NOT the project/panel id —
+ * so, unlike the original bug, there's nothing for two concurrent requests
+ * to collide on. The route handler moves (renames — same volume, so it's
+ * instant) the finished files into the real project/panel folder once
+ * multer has fully parsed the request and the ids are known, regardless of
+ * what order the client sent fields in.
  */
 const panelUpload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination: (req, _file, cb) => {
+      if (req._panelTempDir) return cb(null, req._panelTempDir); // 2nd file field, same request
+      const dir = path.join(config.dirs.temp, `panel_${Date.now()}_${randomId(6)}`);
+      fs.mkdir(dir, { recursive: true }, (err) => {
+        if (err) return cb(err);
+        req._panelTempDir = dir;
+        cb(null, dir);
+      });
+    },
+    filename: (_req, file, cb) => {
+      if (file.fieldname === "image") return cb(null, `image${path.extname(file.originalname || ".jpg").toLowerCase() || ".jpg"}`);
+      cb(null, `audio${path.extname(file.originalname || ".mp3").toLowerCase() || ".mp3"}`);
+    },
+  }),
   limits: { fileSize: config.limits.imageFileBytes, files: 4 },
 });
 
