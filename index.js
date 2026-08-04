@@ -66,6 +66,7 @@ app.use(express.json({ limit: "2gb" }));
 app.use(express.urlencoded({ extended: true, limit: "2gb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/output", express.static(path.join(__dirname, "output")));
+app.use("/music-files", express.static(process.env.MUSIC_DIR || path.join(__dirname, "music")));
 
 app.use((req, _res, next) => {
   console.log(`${req.method} ${req.originalUrl}`);
@@ -87,8 +88,11 @@ app.use((req, res, next) => {
 const UPLOADS_ROOT = path.join(__dirname, "uploads");
 const OUTPUT_ROOT  = path.join(__dirname, "output");
 const TEMP_ROOT    = path.join(__dirname, "temp");
+// PERSISTENT background-music library. Never touched by the auto-cleanup job,
+// so uploaded tracks stay available until the app itself is deleted.
+const MUSIC_ROOT   = process.env.MUSIC_DIR || path.join(__dirname, "music");
 
-[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT].forEach((dir) => {
+[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT, MUSIC_ROOT].forEach((dir) => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -1037,6 +1041,231 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
   }
 });
 
+// ==========================================================
+// BACKGROUND MUSIC LIBRARY (persistent)
+// Tracks live in MUSIC_ROOT and are NEVER auto-deleted, so the
+// library survives renders/restarts for the life of the app.
+// ==========================================================
+
+const AUDIO_EXT_RE = /\.(mp3|m4a|aac|wav|ogg|opus|flac)$/i;
+
+const musicUpload = multer({
+  storage: multer.diskStorage({
+    destination: MUSIC_ROOT,
+    filename: (_req, file, cb) => {
+      const ext = (path.extname(file.originalname) || ".mp3").toLowerCase();
+      const base = safeName(path.basename(file.originalname, path.extname(file.originalname)), "track");
+      cb(null, `${base}_${Date.now().toString(36)}${ext}`);
+    }
+  }),
+  limits: { fileSize: 100 * 1024 * 1024, files: 1 }
+});
+
+function listMusicTracks() {
+  try {
+    return fs.readdirSync(MUSIC_ROOT)
+      .filter((f) => AUDIO_EXT_RE.test(f))
+      .map((f) => {
+        let size = 0;
+        try { size = fs.statSync(path.join(MUSIC_ROOT, f)).size; } catch (_) {}
+        return {
+          id: f,
+          name: path.basename(f, path.extname(f)).replace(/_[a-z0-9]{6,}$/i, "").replace(/[_-]+/g, " ").trim() || f,
+          file: f,
+          url: `/music-files/${encodeURIComponent(f)}`,
+          sizeBytes: size,
+          permanent: true
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (_) {
+    return [];
+  }
+}
+
+function resolveMusicTrack(trackId) {
+  if (!trackId) return null;
+  const wanted = String(trackId);
+  const tracks = listMusicTracks();
+  const hit =
+    tracks.find((t) => t.id === wanted) ||
+    tracks.find((t) => t.file === wanted) ||
+    tracks.find((t) => t.name.toLowerCase() === wanted.toLowerCase()) ||
+    tracks.find((t) => t.id.toLowerCase().startsWith(wanted.toLowerCase()));
+  return hit ? path.join(MUSIC_ROOT, hit.file) : null;
+}
+
+// GET /music — list the permanent library
+app.get("/music", (req, res) => {
+  const tracks = listMusicTracks();
+  res.json({ success: true, tracks, count: tracks.length, storage: "permanent" });
+});
+
+// POST /music — add a track to the permanent library
+app.post("/music", musicUpload.single("music"), (req, res) => {
+  try {
+    const f = req.file;
+    if (!f) return res.status(400).json({ success: false, error: "music file required" });
+    if (!AUDIO_EXT_RE.test(f.filename)) {
+      try { fs.unlinkSync(f.path); } catch (_) {}
+      return res.status(400).json({ success: false, error: "Unsupported audio format" });
+    }
+    const track = listMusicTracks().find((t) => t.file === f.filename);
+    console.log(`[music] saved permanent track: ${f.filename}`);
+    return res.json({ success: true, track, ...track });
+  } catch (err) {
+    console.error("/music upload error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /music/:id — explicit removal only (never automatic)
+app.delete("/music/:id", (req, res) => {
+  const p = resolveMusicTrack(req.params.id);
+  if (!p) return res.status(404).json({ success: false, error: "Track not found" });
+  try {
+    fs.unlinkSync(p);
+    return res.json({ success: true, deleted: path.basename(p) });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Stream a single track (kept for frontends that request /music/:id directly)
+app.get("/music/:id", (req, res) => {
+  const p = resolveMusicTrack(req.params.id);
+  if (!p) return res.status(404).json({ success: false, error: "Track not found" });
+  res.sendFile(p);
+});
+
+// ==========================================================
+// FINAL AUDIO PASS — voice normalization + background music mix
+// Runs once on the concatenated video, so voice and music stay
+// in sync and the loudness is consistent across the whole video.
+// ==========================================================
+
+function buildFinalAudioFilter({ totalDuration, voiceVolume, targetLUFS, normalize, enhance, hasMusic, musicVolume, crossfade, duck }) {
+  const fadeLen = Math.max(0, Math.min(6, Number(crossfade) || 0));
+  const voice = [];
+
+  if (enhance) {
+    voice.push("highpass=f=85", "lowpass=f=15000", "acompressor=threshold=0.06:ratio=3:attack=8:release=120");
+  }
+  if (normalize) {
+    const I = Math.max(-24, Math.min(-9, Number(targetLUFS) || -16));
+    voice.push(`loudnorm=I=${I}:TP=-1.5:LRA=11`);
+  }
+  voice.push(`volume=${Number(voiceVolume || 1).toFixed(3)}`);
+  voice.push("aresample=44100", "aformat=sample_fmts=fltp:channel_layouts=stereo");
+
+  if (!hasMusic) {
+    return `[0:a]${voice.join(",")}[aout]`;
+  }
+
+  const music = [
+    `volume=${Number(musicVolume || 0.15).toFixed(3)}`,
+    "aresample=44100",
+    "aformat=sample_fmts=fltp:channel_layouts=stereo",
+    `atrim=0:${totalDuration.toFixed(3)}`
+  ];
+  if (fadeLen > 0) {
+    music.push(`afade=t=in:st=0:d=${fadeLen}`);
+    music.push(`afade=t=out:st=${Math.max(0, totalDuration - fadeLen).toFixed(3)}:d=${fadeLen}`);
+  }
+
+  const chain = [
+    `[0:a]${voice.join(",")}[voice]`,
+    `[1:a]${music.join(",")}[bed]`
+  ];
+
+  if (duck) {
+    // Music automatically dips while narration plays.
+    chain.push(`[voice]asplit=2[v1][vkey]`);
+    chain.push(`[bed][vkey]sidechaincompress=threshold=0.05:ratio=6:attack=15:release=350[bedducked]`);
+    chain.push(`[v1][bedducked]amix=inputs=2:duration=first:dropout_transition=0,alimiter=limit=0.97[aout]`);
+  } else {
+    chain.push(`[voice][bed]amix=inputs=2:duration=first:dropout_transition=0,alimiter=limit=0.97[aout]`);
+  }
+
+  return chain.join(";");
+}
+
+async function applyFinalAudio(inPath, outPath, totalDuration, renderOptions) {
+  const audioOpts = renderOptions.audioChain || {};
+  const musicOpts = renderOptions.musicChain || {};
+
+  let musicPath = null;
+  if (musicOpts.enabled) {
+    musicPath = musicOpts.filePath && fs.existsSync(musicOpts.filePath)
+      ? musicOpts.filePath
+      : resolveMusicTrack(musicOpts.track);
+    if (!musicPath) {
+      const lib = listMusicTracks();
+      if (lib.length) musicPath = path.join(MUSIC_ROOT, lib[0].file);
+    }
+    if (!musicPath) console.warn("[audio] Background music requested but no track available — skipping music.");
+  }
+
+  const hasMusic = Boolean(musicPath);
+  const needsVoiceWork = audioOpts.normalize !== false || audioOpts.enhance || Number(audioOpts.voiceVolume || 1) !== 1;
+
+  if (!hasMusic && !needsVoiceWork) {
+    fs.copyFileSync(inPath, outPath);
+    return { music: null };
+  }
+
+  const filter = buildFinalAudioFilter({
+    totalDuration,
+    voiceVolume: audioOpts.voiceVolume,
+    targetLUFS: audioOpts.targetLUFS,
+    normalize: audioOpts.normalize !== false,
+    enhance: audioOpts.enhance,
+    hasMusic,
+    musicVolume: musicOpts.volume,
+    crossfade: musicOpts.crossfade,
+    duck: musicOpts.duck
+  });
+
+  const args = ["-i", inPath];
+  if (hasMusic) {
+    if (musicOpts.loop !== false) args.push("-stream_loop", "-1");
+    args.push("-i", musicPath);
+  }
+  args.push(
+    "-filter_complex", filter,
+    "-map", "0:v",
+    "-map", "[aout]",
+    "-c:v", "copy",
+    "-c:a", "aac",
+    "-b:a", renderOptions.audioBitrate || "192k",
+    "-ar", "44100",
+    "-ac", "2",
+    "-t", totalDuration.toFixed(3),
+    "-movflags", "+faststart",
+    "-y", outPath
+  );
+
+  console.log(`[audio] Final pass — music=${hasMusic ? path.basename(musicPath) : "none"} vol=${musicOpts.volume} normalize=${audioOpts.normalize !== false}`);
+  await spawnFfmpeg(args, "final audio pass (normalize + music mix)");
+  return { music: hasMusic ? path.basename(musicPath) : null };
+}
+
+/** Mixes audio in place on the final MP4; falls back to the untouched file on error. */
+async function finalizeAudio(finalPath, durations, renderOptions) {
+  const total = durations.reduce((s, d) => s + Number(d || 0), 0);
+  if (!total) return { music: null };
+  const tmpOut = path.join(TEMP_ROOT, `mix_${Date.now()}_${crypto.randomBytes(3).toString("hex")}.mp4`);
+  try {
+    const info = await applyFinalAudio(finalPath, tmpOut, total, renderOptions);
+    fs.renameSync(tmpOut, finalPath);
+    return info;
+  } catch (err) {
+    console.error(`[audio] Final audio pass failed — keeping original audio: ${err.message.split("\n")[0]}`);
+    try { fs.unlinkSync(tmpOut); } catch (_) {}
+    return { music: null, error: err.message.split("\n")[0] };
+  }
+}
+
 // ================================
 // RENDER ROUTE (async background job)
 // ================================
@@ -1067,7 +1296,26 @@ function handleRender(req, res) {
   if (req.files) {
     const f = req.files.overlay?.[0] || req.files.overlayLogo?.[0] || req.files.watermark?.[0];
     if (f) req._overlayPath = f.path;
+
+    // Inline background-music upload: copied into the permanent library so it
+    // stays available for every future render.
+    const m = req.files.music?.[0] || req.files.musicFile?.[0];
+    if (m) {
+      try {
+        const ext = (path.extname(m.originalname) || ".mp3").toLowerCase();
+        const base = safeName(path.basename(m.originalname || "track", path.extname(m.originalname || "")), "track");
+        const dest = path.join(MUSIC_ROOT, `${base}_${Date.now().toString(36)}${ext}`);
+        fs.copyFileSync(m.path, dest);
+        try { fs.unlinkSync(m.path); } catch (_) {}
+        req._musicPath = dest;
+        console.log(`[music] inline track stored permanently: ${path.basename(dest)}`);
+      } catch (e) {
+        req._musicPath = m.path;
+        console.warn(`[music] could not persist inline track: ${e.message}`);
+      }
+    }
   }
+
 
   const hasProjectId = req.body?.project_id || req.body?.projectId;
 
@@ -1116,7 +1364,9 @@ app.post("/render", (req, res) => {
     overlayUpload.fields([
       { name: "overlay",     maxCount: 1 },
       { name: "overlayLogo", maxCount: 1 },
-      { name: "watermark",   maxCount: 1 }
+      { name: "watermark",   maxCount: 1 },
+      { name: "music",       maxCount: 1 },
+      { name: "musicFile",   maxCount: 1 }
     ])(req, res, (err) => {
       if (err) {
         console.error("[/render] overlay multer error:", err.message);
@@ -1156,6 +1406,41 @@ function extractRenderOptions(body) {
   } catch (_) { overlay = null; }
   if (overlay && (overlay.enabled === false || overlay.enabled === "false")) overlay = null;
 
+  // Audio chain (normalization now lives here, in the backend, not in the app UI)
+  let audioIn = {};
+  try {
+    const raw = body.audio;
+    if (raw) audioIn = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (_) { audioIn = {}; }
+
+  const truthy = (v, dflt) =>
+    v === undefined || v === null || v === "" ? dflt : (v === true || v === "true" || v === 1 || v === "1");
+
+  const audioChain = {
+    // Always normalize unless explicitly disabled — handled server-side.
+    normalize:   truthy(audioIn.normalize ?? body.audioNormalize ?? body.audio_normalize ?? body.loudnorm, true),
+    targetLUFS:  Number(audioIn.targetLUFS ?? body.targetLUFS ?? -16),
+    voiceVolume: Math.max(0.2, Math.min(3, Number(audioIn.voiceVolume ?? body.voiceVolume ?? 1))),
+    enhance:     truthy(audioIn.voiceEnhancement ?? audioIn.enhance ?? body.smoothAudio, false)
+  };
+
+  // Background music
+  let musicIn = {};
+  try {
+    const raw = audioIn.music || body.music;
+    if (raw) musicIn = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (_) { musicIn = {}; }
+
+  const musicChain = {
+    enabled:   truthy(musicIn.enabled ?? body.musicEnabled, false),
+    track:     musicIn.track ?? body.musicTrack ?? null,
+    // Full volume control: 0 (silent) → 2 (double).
+    volume:    Math.max(0, Math.min(2, Number(musicIn.volume ?? body.musicVolume ?? 0.15))),
+    loop:      truthy(musicIn.loop ?? body.musicLoop, true),
+    crossfade: Number(musicIn.crossfade === true ? 2 : (musicIn.crossfade ?? body.musicCrossfade ?? 2)),
+    duck:      truthy(musicIn.duck ?? musicIn.autoDuck ?? body.musicDuck, true)
+  };
+
   return {
     smoothAudio:   body.smoothAudio === true || body.smoothAudio === "true",
     crf:           body.crf || 21,
@@ -1173,7 +1458,9 @@ function extractRenderOptions(body) {
     focusX:        body.focusX || 0.5,
     focusY:        body.focusY || 0.5,
     aspectMode,
-    overlay
+    overlay,
+    audioChain,
+    musicChain
   };
 }
 
@@ -1248,6 +1535,10 @@ async function renderFromProject(req, jobId) {
   if (req._overlayPath && fs.existsSync(req._overlayPath)) {
     renderOptions.overlayPath = req._overlayPath;
   }
+  if (req._musicPath && fs.existsSync(req._musicPath)) {
+    renderOptions.musicChain.filePath = req._musicPath;
+    renderOptions.musicChain.enabled = true;
+  }
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -1312,6 +1603,9 @@ async function renderFromProject(req, jobId) {
     await concatWithTransitions(segPaths, durations, finalPath, renderOptions);
     cleanupFiles(segPaths);
 
+    updateJob(jobId, { progress: 92 });
+    const mixInfo = await finalizeAudio(finalPath, durations, renderOptions);
+
     const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
     const url  = `${host}/output/${jobId}_final.mp4`;
 
@@ -1333,6 +1627,8 @@ async function renderFromProject(req, jobId) {
       batchIndex,
       totalBatches,
       renderer: RENDERER_NAME,
+      music: mixInfo.music,
+      audioNormalized: renderOptions.audioChain.normalize !== false,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
       fps: 15,
@@ -1433,6 +1729,9 @@ async function renderFromMultipart(req, jobId) {
     await concatWithTransitions(segPaths, durations, finalPath, renderOptions);
     cleanupFiles([...segPaths, ...uploadPaths]);
 
+    updateJob(jobId, { progress: 92 });
+    const mixInfo = await finalizeAudio(finalPath, durations, renderOptions);
+
     const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
     const url  = `${host}/output/${jobId}_final.mp4`;
 
@@ -1453,6 +1752,8 @@ async function renderFromMultipart(req, jobId) {
       batchIndex,
       totalBatches,
       renderer: RENDERER_NAME,
+      music: mixInfo.music,
+      audioNormalized: renderOptions.audioChain.normalize !== false,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
       fps: 15,
