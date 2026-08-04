@@ -11,6 +11,17 @@ const { logger } = require("../utils/logger");
 
 const router = express.Router();
 
+/** rename() with a copy+delete fallback for the (here, unlikely) case temp and uploads end up on different volumes. */
+async function safeMove(src, dest) {
+  try {
+    await fsp.rename(src, dest);
+  } catch (err) {
+    if (err.code !== "EXDEV") throw err;
+    await fsp.copyFile(src, dest);
+    await fsp.unlink(src);
+  }
+}
+
 router.post(
   "/panel",
   panelUpload.fields([
@@ -29,18 +40,24 @@ router.post(
       const image = req.files?.image?.[0];
       if (!image) return res.status(400).json({ success: false, error: "Image required" });
       const audio = req.files?.audio?.[0];
+      const tempDir = req._panelTempDir;
 
       const panelDir = path.join(config.dirs.uploads, bodyProject, bodyPanel);
       await fsp.mkdir(panelDir, { recursive: true });
 
-      const imageName = `image${path.extname(image.originalname || ".jpg").toLowerCase() || ".jpg"}`;
-      await fsp.writeFile(path.join(panelDir, imageName), image.buffer);
+      // multer already streamed these to disk with the right names
+      // (image.jpg / audio.mp3 etc) in the per-request temp dir — just
+      // move them into their final home. Same volume, so this is an
+      // instant metadata-only op, not a copy.
+      const imageName = image.filename;
+      await safeMove(path.join(tempDir, imageName), path.join(panelDir, imageName));
 
       let audioName = null;
       if (audio) {
-        audioName = `audio${path.extname(audio.originalname || ".mp3").toLowerCase() || ".mp3"}`;
-        await fsp.writeFile(path.join(panelDir, audioName), audio.buffer);
+        audioName = audio.filename;
+        await safeMove(path.join(tempDir, audioName), path.join(panelDir, audioName));
       }
+      await fsp.rm(tempDir, { recursive: true, force: true });
       const zoom = clamp(Number(req.body.zoom || req.body.zoomFactor || 1), 1, 3);
       const focusX = normFocus(req.body.focusX ?? req.body.cropX);
       const focusY = normFocus(req.body.focusY ?? req.body.cropY);
@@ -72,6 +89,7 @@ router.post(
       });
     } catch (err) {
       logger.error("panel", err.message);
+      if (req._panelTempDir) await fsp.rm(req._panelTempDir, { recursive: true, force: true }).catch(() => {});
       res.status(500).json({ success: false, error: err.message });
     }
   },
