@@ -1181,7 +1181,7 @@ function buildFinalAudioFilter({ totalDuration, voiceVolume, targetLUFS, normali
   if (duck) {
     // Music automatically dips while narration plays.
     chain.push(`[voice]asplit=2[v1][vkey]`);
-    chain.push(`[bed][vkey]sidechaincompress=threshold=0.05:ratio=6:attack=15:release=350[bedducked]`);
+    chain.push(`[bed][vkey]sidechaincompress=threshold=0.2:ratio=2.5:attack=20:release=400:makeup=1[bedducked]`);
     chain.push(`[v1][bedducked]amix=inputs=2:duration=first:dropout_transition=0,alimiter=limit=0.97[aout]`);
   } else {
     chain.push(`[voice][bed]amix=inputs=2:duration=first:dropout_transition=0,alimiter=limit=0.97[aout]`);
@@ -1427,7 +1427,8 @@ function extractRenderOptions(body) {
   // Background music
   let musicIn = {};
   try {
-    const raw = audioIn.music || body.music;
+    const raw = audioIn.music || audioIn.backgroundMusic || audioIn.background_music ||
+                body.music || body.backgroundMusic || body.background_music;
     if (raw) musicIn = typeof raw === "string" ? JSON.parse(raw) : raw;
   } catch (_) { musicIn = {}; }
 
