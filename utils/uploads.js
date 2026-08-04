@@ -7,17 +7,10 @@ const config = require("../config");
 const { randomId, safeName } = require("../utils/files");
 
 /**
- * Resolve the project/panel ids a panel-upload request is for.
- *
- * IMPORTANT: this is called from multer's destination() callback, which
- * fires once per incoming file *as multer streams the multipart body*.
- * express never parses multipart bodies itself, so req.body is only ever
- * populated by multer's own field parser as it goes — meaning any text
- * fields the client appended to the FormData *before* the file fields
- * (project_id/panel_id in this app) are already on req.body by the time
- * the image/audio file arrives, even though the request as a whole hasn't
- * finished parsing yet. Query params (if the client used them) are used
- * first since those are known immediately, before parsing even starts.
+ * Resolve the project/panel ids a panel-upload request is for. Called from
+ * the route handler AFTER multer has fully parsed the request (see the
+ * memoryStorage comment on panelUpload below for why), so req.body is
+ * always complete here regardless of what order the client sent fields in.
  */
 function resolvePanelIds(req) {
   const projectId = safeName(
@@ -42,43 +35,20 @@ function diskStorage(destination, prefix) {
 }
 
 /**
- * Panel upload writes straight into the panel folder — the old handler wrote
- * the file to /uploads, read it fully back into a Buffer, wrote it again into
- * the panel dir and then unlinked it (3 disk ops + full-file RAM per image).
+ * Panel upload buffers image/audio in memory instead of streaming to a
+ * per-file destination. This is deliberate: multer parses a multipart
+ * request's parts strictly in the order the browser appended them, and
+ * different frontends append the id fields and the file fields in
+ * different orders — some send ids first, some send the image first. A
+ * destination() callback can only see whatever has already been parsed at
+ * that instant, so it can never be reliably correct for both orderings.
+ * Buffering the (small, single-image/audio) files in RAM and writing them
+ * out ourselves once the whole request is fully parsed sidesteps that
+ * entirely — by the time our route handler runs, req.body always has
+ * every field, no matter what order the client sent them in.
  */
 const panelUpload = multer({
-  storage: multer.diskStorage({
-    // Resolve the *real* project/panel dir directly, per-file, instead of
-    // writing into a temp dir and renaming it after the fact. This is what
-    // removes the ENOENT-on-rename race: the file is written straight into
-    // its final home the first time, so there is no second folder for a
-    // concurrent request to have already moved out from under us.
-    destination: (req, file, cb) => {
-      if (req._panelDir) return cb(null, req._panelDir); // already resolved for this request (2nd file field)
-      const { projectId, panelId } = resolvePanelIds(req);
-      if (!projectId || !panelId) {
-        return cb(
-          new Error(
-            "project_id and panel_id must be included as form fields (or query params) BEFORE the image/audio fields in the upload request",
-          ),
-        );
-      }
-      const dir = path.join(config.dirs.uploads, projectId, panelId);
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-      } catch (err) {
-        return cb(err);
-      }
-      req._panelDir = dir;
-      req._projectId = projectId;
-      req._panelId = panelId;
-      cb(null, dir);
-    },
-    filename: (_req, file, cb) => {
-      if (file.fieldname === "image") return cb(null, `image${path.extname(file.originalname || ".jpg").toLowerCase() || ".jpg"}`);
-      cb(null, `audio${path.extname(file.originalname || ".mp3").toLowerCase() || ".mp3"}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: config.limits.imageFileBytes, files: 4 },
 });
 
@@ -102,4 +72,4 @@ const musicUpload = multer({
   limits: { fileSize: 100 * 1024 * 1024, files: 1 },
 });
 
-module.exports = { panelUpload, imagesUpload, zipUpload, overlayUpload, musicUpload };
+module.exports = { panelUpload, imagesUpload, zipUpload, overlayUpload, musicUpload, resolvePanelIds };
