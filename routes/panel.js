@@ -6,7 +6,7 @@ const fsp = require("fs/promises");
 const path = require("path");
 const config = require("../config");
 const { safeName, writeJson, readJson } = require("../utils/files");
-const { panelUpload } = require("../utils/uploads");
+const { panelUpload, resolvePanelIds } = require("../utils/uploads");
 const { logger } = require("../utils/logger");
 
 const router = express.Router();
@@ -19,28 +19,28 @@ router.post(
   ]),
   async (req, res) => {
     try {
-      // The multer destination() callback (utils/uploads.js) already wrote
-      // the file straight into its final project/panel folder and stamped
-      // the resolved ids on req — no post-hoc rename needed anymore.
-      const bodyProject = req._projectId;
-      const bodyPanel = req._panelId;
-      const panelDir = req._panelDir;
-
-      if (!bodyProject || !bodyPanel || !panelDir) {
+      // multer has now fully parsed the request, so req.body has every
+      // field the client sent regardless of what order it sent them in.
+      const { projectId: bodyProject, panelId: bodyPanel } = resolvePanelIds(req);
+      if (!bodyProject || !bodyPanel) {
         return res.status(400).json({ success: false, error: "project_id and panel_id are required" });
       }
 
       const image = req.files?.image?.[0];
       if (!image) return res.status(400).json({ success: false, error: "Image required" });
-
-      // Belt-and-suspenders: verify the folder we just wrote into is really
-      // there before we trust it (guards against any future racing cleanup).
-      if (!fs.existsSync(panelDir)) {
-        logger.error("panel", `panel dir missing right after upload: ${panelDir}`);
-        return res.status(500).json({ success: false, error: "Panel folder went missing during upload" });
-      }
-
       const audio = req.files?.audio?.[0];
+
+      const panelDir = path.join(config.dirs.uploads, bodyProject, bodyPanel);
+      await fsp.mkdir(panelDir, { recursive: true });
+
+      const imageName = `image${path.extname(image.originalname || ".jpg").toLowerCase() || ".jpg"}`;
+      await fsp.writeFile(path.join(panelDir, imageName), image.buffer);
+
+      let audioName = null;
+      if (audio) {
+        audioName = `audio${path.extname(audio.originalname || ".mp3").toLowerCase() || ".mp3"}`;
+        await fsp.writeFile(path.join(panelDir, audioName), audio.buffer);
+      }
       const zoom = clamp(Number(req.body.zoom || req.body.zoomFactor || 1), 1, 3);
       const focusX = normFocus(req.body.focusX ?? req.body.cropX);
       const focusY = normFocus(req.body.focusY ?? req.body.cropY);
@@ -49,9 +49,9 @@ router.post(
         index: Number(req.body.index || 0),
         duration: Number(req.body.duration || 4),
         narration: String(req.body.narration || "").trim(),
-        image: path.basename(image.path),
-        audio: audio ? path.basename(audio.path) : null,
-        audio_source: audio ? "upload" : null,
+        image: imageName,
+        audio: audioName,
+        audio_source: audioName ? "upload" : null,
         tts_duration: Number(req.body.tts_duration || req.body.ttsDuration || 0) || null,
         tts_provider: req.body.tts_provider || req.body.ttsProvider || null,
         zoom,
