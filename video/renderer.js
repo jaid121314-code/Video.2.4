@@ -126,6 +126,12 @@ async function renderPanels({ jobId, panels, options, host, meta = {} }) {
 
     const clipPaths = results.filter(Boolean);
     if (!clipPaths.length) throw new Error("All panels failed to render — no clips produced.");
+    if (skipped > 0) {
+      logger.error(
+        "render",
+        `${jobId}: ${skipped}/${panels.length} panel clip(s) FAILED and were dropped from the final video (see [clip] warnings above for cause)`,
+      );
+    }
 
     // ---- Merge (lossless stream-copy) --------------------------------------
     jobStore.update(jobId, { progress: 84, message: "Merging clips" });
@@ -171,7 +177,7 @@ async function renderPanels({ jobId, panels, options, host, meta = {} }) {
     jobStore.update(jobId, {
       status: "done",
       progress: 100,
-      message: "Done",
+      message: skipped > 0 ? `Done — ${skipped}/${panels.length} panel(s) failed and were skipped` : "Done",
       url,
       videoUrl: url,
       video_url: url,
@@ -179,6 +185,7 @@ async function renderPanels({ jobId, panels, options, host, meta = {} }) {
       panels: panels.length,
       rendered: clipPaths.length,
       skipped,
+      warning: skipped > 0 ? `${skipped} of ${panels.length} panels failed to encode and are missing from the final video.` : null,
       renderer: config.rendererName,
       format: "MP4 (H.264 + AAC)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
