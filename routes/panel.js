@@ -11,51 +11,34 @@ const { logger } = require("../utils/logger");
 
 const router = express.Router();
 
-/** Prepare the destination folder before multer streams the file into it. */
-function preparePanelDir(req, res, next) {
-  try {
-    const projectId = safeName(req.query.project_id || req.query.projectId || req.body?.project_id || req.body?.projectId, "project");
-    const panelId = safeName(
-      req.query.panel_id || req.query.panelId || req.body?.panel_id || req.body?.panelId || `panel_${Date.now()}`,
-      "panel",
-    );
-    const dir = path.join(config.dirs.uploads, projectId, panelId);
-    fs.mkdirSync(dir, { recursive: true });
-    req._panelDir = dir;
-    req._projectId = projectId;
-    req._panelId = panelId;
-    next();
-  } catch (err) {
-    next(err);
-  }
-}
-
 router.post(
   "/panel",
-  preparePanelDir,
   panelUpload.fields([
     { name: "image", maxCount: 1 },
     { name: "audio", maxCount: 1 },
   ]),
   async (req, res) => {
     try {
-      // Body fields may only be known after multer parsed the form; if the
-      // client sent ids in the body (old behaviour) and they differ from the
-      // query fallback, move the folder rather than re-uploading.
-      const bodyProject = safeName(req.body.project_id || req.body.projectId, req._projectId);
-      const bodyPanel = safeName(req.body.panel_id || req.body.panelId, req._panelId);
+      // The multer destination() callback (utils/uploads.js) already wrote
+      // the file straight into its final project/panel folder and stamped
+      // the resolved ids on req — no post-hoc rename needed anymore.
+      const bodyProject = req._projectId;
+      const bodyPanel = req._panelId;
+      const panelDir = req._panelDir;
 
-      let panelDir = req._panelDir;
-      if (bodyProject !== req._projectId || bodyPanel !== req._panelId) {
-        const target = path.join(config.dirs.uploads, bodyProject, bodyPanel);
-        await fsp.mkdir(path.dirname(target), { recursive: true });
-        await fsp.rm(target, { recursive: true, force: true });
-        await fsp.rename(panelDir, target);
-        panelDir = target;
+      if (!bodyProject || !bodyPanel || !panelDir) {
+        return res.status(400).json({ success: false, error: "project_id and panel_id are required" });
       }
 
       const image = req.files?.image?.[0];
       if (!image) return res.status(400).json({ success: false, error: "Image required" });
+
+      // Belt-and-suspenders: verify the folder we just wrote into is really
+      // there before we trust it (guards against any future racing cleanup).
+      if (!fs.existsSync(panelDir)) {
+        logger.error("panel", `panel dir missing right after upload: ${panelDir}`);
+        return res.status(500).json({ success: false, error: "Panel folder went missing during upload" });
+      }
 
       const audio = req.files?.audio?.[0];
       const zoom = clamp(Number(req.body.zoom || req.body.zoomFactor || 1), 1, 3);
