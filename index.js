@@ -595,6 +595,11 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       videoFilterFlag = ["-filter_complex", complex, "-map", "[outv]", "-map", "1:a?"];
     }
 
+    // Force every panel audio stream to start at timestamp zero and have the
+    // exact same duration as its image segment. This prevents cumulative AAC
+    // encoder-delay / timestamp drift when many panel clips are joined.
+    const exactAudioFilter = `aresample=44100:async=1:first_pts=0,apad,atrim=0:${Number(duration).toFixed(3)},asetpts=N/SR/TB`;
+
     const outputOpts = [
       ...videoFilterFlag,
       `-c:v ${videoCodec}`,
@@ -605,10 +610,10 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       `-preset ${preset}`,
       `-threads 0`,      // ← Let FFmpeg use all available CPU cores
       `-movflags ${movflags}`,
+      `-af ${exactAudioFilter}`,
       `-c:a aac`,
       `-b:a ${audioBitrate}`,
-      "-shortest",
-      `-t ${duration}`
+      `-t ${Number(duration).toFixed(3)}`
     ];
 
     // Add bitrate control if specified
@@ -752,21 +757,33 @@ async function concatWithTransitions(segPaths, durations, outPath, renderOptions
   const concatFile = path.join(TEMP_ROOT, `concat_${Date.now()}.txt`);
   fs.writeFileSync(concatFile, segPaths.map(s => `file '${s}'`).join("\n"), "utf8");
 
-  // Stream-copy concat — no decoding/re-encoding, zero quality loss, very fast
+  // Keep the video lossless, but rebuild the joined AAC stream. Concatenating
+  // independently encoded AAC streams with `-c copy` preserves encoder priming
+  // and timestamp discontinuities at every panel boundary, which causes the
+  // narration to drift away from the images over time.
   const args = [
+    "-fflags", "+genpts",
     "-f",      "concat",
     "-safe",   "0",
     "-i",      concatFile,
-    "-c",      "copy",        // ← LOSSLESS: copy all streams, no re-render
+    "-map",    "0:v:0",
+    "-map",    "0:a:0",
+    "-c:v",    "copy",
+    "-af",     "aresample=44100:async=1:first_pts=0,asetpts=N/SR/TB",
+    "-c:a",    "aac",
+    "-b:a",    "192k",
+    "-ar",     "44100",
+    "-ac",     "2",
+    "-avoid_negative_ts", "make_zero",
     "-movflags", "+faststart",
     "-y",
     outPath
   ];
 
-  console.log("[concat] Running lossless stream-copy concat...");
+  console.log("[concat] Joining video losslessly and rebuilding continuous audio timestamps...");
   try {
-    await spawnFfmpeg(args, "lossless stream-copy concat");
-    console.log(`[concat] ✓ stream-copy concat succeeded`);
+    await spawnFfmpeg(args, "timestamp-safe concat");
+    console.log(`[concat] ✓ timestamp-safe concat succeeded`);
   } finally {
     try { fs.unlinkSync(concatFile); } catch (_) {}
   }
@@ -1252,7 +1269,16 @@ async function applyFinalAudio(inPath, outPath, totalDuration, renderOptions) {
 
 /** Mixes audio in place on the final MP4; falls back to the untouched file on error. */
 async function finalizeAudio(finalPath, durations, renderOptions) {
-  const total = durations.reduce((s, d) => s + Number(d || 0), 0);
+  // Use the real muxed duration rather than the planned sum. Container/audio
+  // rounding can differ by a few milliseconds per panel and accumulate.
+  const probed = await new Promise((resolve) => {
+    ffmpeg.ffprobe(finalPath, (err, data) => {
+      if (err) return resolve(0);
+      resolve(Number(data?.format?.duration || 0));
+    });
+  });
+  const planned = durations.reduce((s, d) => s + Number(d || 0), 0);
+  const total = probed > 0 ? probed : planned;
   if (!total) return { music: null };
   const tmpOut = path.join(TEMP_ROOT, `mix_${Date.now()}_${crypto.randomBytes(3).toString("hex")}.mp4`);
   try {
